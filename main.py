@@ -1,39 +1,67 @@
-
 import cv2
 import mediapipe as mp
 import math
 import time
 import tkinter as tk
-
 from collections import deque
 from PIL import Image, ImageTk
 
 
 # ---------------- CONFIGURATION ----------------
 
-NEAR_DISTANCE = 0.02
-APPROACH_DISTANCE = 0.30
-
+# Normalized distances relative to the webcam frame diagonal.
+# Tune these values for your camera position and distance from the screen.
+FACE_TOUCH_DISTANCE = 0.035
 PERSISTENCE_SECONDS = 0.5
-APPROACH_DELTA = 0.015
-
 COOLDOWN_SECONDS = 2.0
 SMOOTHING_FRAMES = 5
+RESET_DISTANCE = 0.045
 
 PANEL_WIDTH = 400
 PANEL_HEIGHT = 300
+
+# MediaPipe Face Mesh landmark IDs representing broad facial regions.
+# These are approximate anchor points, not precise face-region boundaries.
+FACE_REGIONS = {
+    "nose": 1,
+    "mouth": 13,
+    "chin": 152,
+    "left cheek": 234,
+    "right cheek": 454,
+}
+
+FINGERTIP_IDS = [4, 8, 12, 16, 20]
 
 
 # ---------------- DISTANCE CALCULATION ----------------
 
 def landmark_distance(point_a, point_b, frame_width, frame_height):
-    """Calculate normalized 2D distance between landmarks."""
+    """Calculate normalized 2D distance between two MediaPipe landmarks."""
     dx = (point_a.x - point_b.x) * frame_width
     dy = (point_a.y - point_b.y) * frame_height
-
     diagonal = math.sqrt(frame_width**2 + frame_height**2)
-
     return math.sqrt(dx**2 + dy**2) / diagonal
+
+
+def closest_hand_to_face(hand_results, face_landmarks, frame_width, frame_height):
+    """Return (minimum distance, region name) across fingertips and face anchors."""
+    candidates = []
+    face = face_landmarks.landmark
+
+    for region_name, landmark_id in FACE_REGIONS.items():
+        region_point = face[landmark_id]
+        for hand in hand_results.multi_hand_landmarks or []:
+            for fingertip_id in FINGERTIP_IDS:
+                fingertip = hand.landmark[fingertip_id]
+                distance = landmark_distance(
+                    fingertip, region_point, frame_width, frame_height
+                )
+                candidates.append((distance, region_name))
+
+    if not candidates:
+        return None, None
+
+    return min(candidates, key=lambda item: item[0])
 
 
 # ---------------- SNAPSHOT SIDE PANEL ----------------
@@ -44,21 +72,18 @@ class SnapshotPanel:
         self.snapshot_window = None
         self.image_label = None
         self.photo = None
-        self.status_label = None
 
-    def show(self, frame):
-        """Display a temporary snapshot without saving it to disk."""
-
-        # Avoid replacing a snapshot that is already visible.
-        if (
-            self.snapshot_window is not None
-            and self.snapshot_window.winfo_exists()
-        ):
-            return
+    def show(self, frame, region_name):
+        """Display a temporary snapshot in memory; never save it to disk."""
+        if self.snapshot_window is not None:
+            try:
+                if self.snapshot_window.winfo_exists():
+                    return
+            except tk.TclError:
+                pass
 
         window = tk.Toplevel(self.root)
         self.snapshot_window = window
-
         window.title("Drishti-Flow | Pattern Interrupt")
         window.geometry("440x440")
         window.resizable(False, False)
@@ -68,47 +93,40 @@ class SnapshotPanel:
         tk.Label(
             window,
             text="PAUSE. NOTICE THE MOMENT.",
-            font=("Segoe UI", 15, "bold"),
+            font=("Arial", 15, "bold"),
             fg="white",
             bg="#171717",
         ).pack(pady=(15, 5))
 
         tk.Label(
             window,
-            text="A possible hand-to-face habit was detected.",
-            font=("Segoe UI", 10),
+            text=f"Possible hand-to-face movement: {region_name}.",
+            font=("Arial", 10),
             fg="#cccccc",
             bg="#171717",
         ).pack(pady=(0, 12))
 
-        # Keep the snapshot in memory only.
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         image = Image.fromarray(rgb_frame)
         image.thumbnail((PANEL_WIDTH, PANEL_HEIGHT))
-
         self.photo = ImageTk.PhotoImage(image=image)
 
-        self.image_label = tk.Label(
-            window,
-            image=self.photo,
-            bg="#171717",
-        )
+        self.image_label = tk.Label(window, image=self.photo, bg="#171717")
         self.image_label.pack(padx=10, pady=5)
 
-        self.status_label = tk.Label(
+        tk.Label(
             window,
             text="Take a breath. Then return to your task.",
-            font=("Segoe UI", 10),
+            font=("Arial", 10),
             fg="#eeeeee",
             bg="#171717",
-        )
-        self.status_label.pack(pady=8)
+        ).pack(pady=8)
 
         tk.Button(
             window,
             text="Dismiss and continue",
             command=self.dismiss,
-            font=("Segoe UI", 10, "bold"),
+            font=("Arial", 10, "bold"),
             bg="#2d6a4f",
             fg="white",
             activebackground="#40916c",
@@ -119,8 +137,6 @@ class SnapshotPanel:
         ).pack(pady=(0, 12))
 
     def dismiss(self):
-        """Close the panel and release the temporary snapshot."""
-
         if self.snapshot_window is not None:
             try:
                 if self.snapshot_window.winfo_exists():
@@ -130,7 +146,6 @@ class SnapshotPanel:
 
         self.snapshot_window = None
         self.image_label = None
-        self.status_label = None
         self.photo = None
 
     def close(self):
@@ -141,9 +156,8 @@ class SnapshotPanel:
 
 def main():
     cap = cv2.VideoCapture(0)
-
     if not cap.isOpened():
-        print("Error: Could not open webcam.")
+        print("Error: Could not open webcam. Check camera permissions.")
         return
 
     mp_face_mesh = mp.solutions.face_mesh
@@ -156,7 +170,6 @@ def main():
         min_detection_confidence=0.5,
         min_tracking_confidence=0.5,
     )
-
     hands = mp_hands.Hands(
         static_image_mode=False,
         max_num_hands=2,
@@ -164,51 +177,41 @@ def main():
         min_tracking_confidence=0.5,
     )
 
-    # Tkinter side panel
     root = tk.Tk()
     root.withdraw()
-
     snapshot_panel = SnapshotPanel(root)
 
     distances = deque(maxlen=SMOOTHING_FRAMES)
-
     near_since = None
     last_alert_time = float("-inf")
-    previous_distance = None
-
-    # Only one snapshot per continuous near-face episode.
     triggered_this_episode = False
-
+    current_region = None
     status = "Waiting for face and hand"
 
-    print("Drishti-Flow | Milestone 3")
+    print("Drishti-Flow | Multi-region face-touch detection")
     print("Press Q in the webcam window to quit.")
+    print("Snapshots are kept in memory only; they are not saved to disk.")
 
     try:
         while True:
             success, frame = cap.read()
-
             if not success:
                 print("Error: Could not read webcam frame.")
                 break
 
             frame = cv2.flip(frame, 1)
             height, width = frame.shape[:2]
-
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             rgb.flags.writeable = False
-
             face_results = face_mesh.process(rgb)
             hand_results = hands.process(rgb)
-
             rgb.flags.writeable = True
 
             face_detected = bool(face_results.multi_face_landmarks)
             hands_detected = bool(hand_results.multi_hand_landmarks)
-
+            trigger_snapshot = False
             current_distance = None
-
-            # -------- DRAW FACE LANDMARKS --------
+            current_region = None
 
             if face_detected:
                 for face_landmarks in face_results.multi_face_landmarks:
@@ -218,77 +221,40 @@ def main():
                         connections=mp_face_mesh.FACEMESH_CONTOURS,
                         landmark_drawing_spec=None,
                         connection_drawing_spec=mp_drawing.DrawingSpec(
-                            color=(0, 255, 0),
-                            thickness=1,
-                            circle_radius=1,
+                            color=(0, 255, 0), thickness=1, circle_radius=1
                         ),
                     )
 
-            # -------- HAND DETECTION --------
+            if hands_detected:
+                for hand in hand_results.multi_hand_landmarks:
+                    mp_drawing.draw_landmarks(
+                        frame, hand, mp_hands.HAND_CONNECTIONS
+                    )
 
             if face_detected and hands_detected:
-                face = face_results.multi_face_landmarks[0].landmark
-                nose = face[1]
-
-                fingertip_ids = [4, 8, 12, 16, 20]
-                candidate_distances = []
-
-                for hand in hand_results.multi_hand_landmarks:
-                    mp_drawing.draw_landmarks(
-                        frame,
-                        hand,
-                        mp_hands.HAND_CONNECTIONS,
-                    )
-
-                    for idx in fingertip_ids:
-                        tip = hand.landmark[idx]
-
-                        distance = landmark_distance(
-                            tip, nose, width, height
-                        )
-                        candidate_distances.append(distance)
-
-                if candidate_distances:
-                    current_distance = min(candidate_distances)
-
-            elif hands_detected:
-                for hand in hand_results.multi_hand_landmarks:
-                    mp_drawing.draw_landmarks(
-                        frame,
-                        hand,
-                        mp_hands.HAND_CONNECTIONS,
-                    )
-
-            # -------- HABIT DETECTION --------
+                current_distance, current_region = closest_hand_to_face(
+                    hand_results,
+                    face_results.multi_face_landmarks[0],
+                    width,
+                    height,
+                )
 
             now = time.monotonic()
-            trigger_snapshot = False
 
             if current_distance is None:
                 distances.clear()
                 near_since = None
-                previous_distance = None
                 triggered_this_episode = False
-
                 status = "Waiting for face and hand"
-
             else:
                 distances.append(current_distance)
                 smooth_distance = sum(distances) / len(distances)
 
-                approaching = (
-                    previous_distance is not None
-                    and smooth_distance
-                    < previous_distance - APPROACH_DELTA
-                )
-
-                if smooth_distance <= NEAR_DISTANCE:
-
+                if smooth_distance <= FACE_TOUCH_DISTANCE:
                     if near_since is None:
                         near_since = now
 
                     duration = now - near_since
-
                     cooldown_finished = (
                         now - last_alert_time >= COOLDOWN_SECONDS
                     )
@@ -298,62 +264,51 @@ def main():
                         and cooldown_finished
                         and not triggered_this_episode
                     ):
-                        # Capture the frame at the detection moment.
                         trigger_snapshot = True
-
                         last_alert_time = now
                         triggered_this_episode = True
-
-                        status = "POSSIBLE HABIT DETECTED"
-
+                        status = f"POSSIBLE FACE TOUCH: {current_region}"
                     elif triggered_this_episode:
-                        status = "Snapshot triggered"
-
-                    elif duration >= PERSISTENCE_SECONDS:
-                        status = "Near face - cooldown"
-
+                        status = f"Detected: {current_region}"
                     else:
-                        status = "Hand near face - checking"
-
+                        status = f"Checking near {current_region}..."
                 else:
-                    near_since = None
-                    triggered_this_episode = False
-
-                    if (
-                        smooth_distance <= APPROACH_DISTANCE
-                        and approaching
-                    ):
-                        status = "Hand approaching face"
+                    # Reset the episode only after the hand moves clearly away.
+                    if smooth_distance >= RESET_DISTANCE:
+                        near_since = None
+                        triggered_this_episode = False
                     else:
-                        status = "No trigger"
+                        near_since = None
 
-                previous_distance = smooth_distance
+                    status = "Hand near face - checking" if smooth_distance < RESET_DISTANCE else "No face touch detected"
 
                 cv2.putText(
                     frame,
                     f"Distance: {smooth_distance:.3f}",
                     (20, 100),
                     cv2.FONT_HERSHEY_SIMPLEX,
-                    0.65,
+                    0.6,
                     (255, 255, 0),
                     2,
                 )
-
-            # -------- CAPTURE AND DISPLAY SNAPSHOT --------
+                if current_region:
+                    cv2.putText(
+                        frame,
+                        f"Closest region: {current_region}",
+                        (20, 130),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.6,
+                        (255, 255, 0),
+                        2,
+                    )
 
             if trigger_snapshot:
-                # This is a copy of the current annotated webcam frame.
-                # It is displayed from memory and never written to disk.
-                snapshot = frame.copy()
-                snapshot_panel.show(snapshot)
+                snapshot_panel.show(frame.copy(), current_region or "face")
 
-            # Process popup events without blocking webcam processing.
             try:
                 root.update()
             except tk.TclError:
                 pass
-
-            # -------- STATUS DISPLAY --------
 
             cv2.putText(
                 frame,
@@ -364,42 +319,38 @@ def main():
                 (0, 255, 0) if face_detected else (0, 0, 255),
                 2,
             )
-
             cv2.putText(
                 frame,
-                f"Hand: {'Yes' if hands_detected else 'No'}",
+                f"Hands: {'Yes' if hands_detected else 'No'}",
                 (20, 60),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.65,
                 (0, 255, 0) if hands_detected else (0, 0, 255),
                 2,
             )
-
             cv2.putText(
                 frame,
-                status,
-                (20, height - 45),
+                status[:55],
+                (20, height - 25),
                 cv2.FONT_HERSHEY_SIMPLEX,
-                0.65,
-                (0, 0, 255)
-                if status == "POSSIBLE HABIT DETECTED"
-                else (255, 255, 255),
+                0.55,
+                (0, 0, 255) if status.startswith("POSSIBLE FACE TOUCH") else (255, 255, 255),
                 2,
             )
 
             cv2.imshow("Drishti-Flow | Habit Detection", frame)
-
             if cv2.waitKey(1) & 0xFF == ord("q"):
                 break
 
     finally:
         snapshot_panel.close()
-        root.destroy()
-
+        try:
+            root.destroy()
+        except tk.TclError:
+            pass
         cap.release()
         face_mesh.close()
         hands.close()
-
         cv2.destroyAllWindows()
 
 
