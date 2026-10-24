@@ -1,4 +1,3 @@
-# Drishti-Flow
 # Drishti-Flow 🧠👁️
 
 **A computer-vision-based habit awareness and pattern interruption system.**
